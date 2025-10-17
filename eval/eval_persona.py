@@ -161,7 +161,7 @@ def load_persona_questions(trait, temperature=1, persona_instructions_type=None,
 
 
 
-async def eval_batched(questions, llm, tokenizer, coef, vector=None, layer=None, n_per_question=100, max_concurrent_judges=100, max_tokens=1000, steering_type="last", lora_path=None):
+async def eval_batched(questions, llm, tokenizer, coef, vector=None, layer=None, n_per_question=100, max_concurrent_judges=100, max_tokens=1000, steering_type="last", lora_path=None, checkpoint_path=None):
     """Batch process all questions together for faster inference"""
     # Collect all prompts from all questions
     all_paraphrases = []
@@ -172,13 +172,33 @@ async def eval_batched(questions, llm, tokenizer, coef, vector=None, layer=None,
         all_paraphrases.extend(paraphrases)
         all_conversations.extend(conversations)
         question_indices.extend([i] * len(paraphrases))
-    
-    # Generate all answers in a single batch
-    print(f"Generating {len(all_conversations)} responses in a single batch...")
-    if coef != 0:
-        prompts, answers = sample_steering(llm, tokenizer, all_conversations, vector, layer, coef, temperature=questions[0].temperature, max_tokens=max_tokens, steering_type=steering_type)
+
+    # Check if we have a checkpoint with responses
+    responses_checkpoint = f"{checkpoint_path}.responses.pt" if checkpoint_path else None
+    if responses_checkpoint and os.path.exists(responses_checkpoint):
+        print(f"Loading responses from checkpoint: {responses_checkpoint}")
+        checkpoint_data = torch.load(responses_checkpoint, weights_only=False)
+        prompts = checkpoint_data['prompts']
+        answers = checkpoint_data['answers']
+        all_paraphrases = checkpoint_data['paraphrases']
+        question_indices = checkpoint_data['question_indices']
     else:
-        prompts, answers = sample(llm, tokenizer, all_conversations, temperature=questions[0].temperature, max_tokens=max_tokens, lora_path=lora_path)
+        # Generate all answers in a single batch
+        print(f"Generating {len(all_conversations)} responses in a single batch...")
+        if coef != 0:
+            prompts, answers = sample_steering(llm, tokenizer, all_conversations, vector, layer, coef, temperature=questions[0].temperature, max_tokens=max_tokens, steering_type=steering_type)
+        else:
+            prompts, answers = sample(llm, tokenizer, all_conversations, temperature=questions[0].temperature, max_tokens=max_tokens, lora_path=lora_path)
+
+        # Save responses checkpoint
+        if responses_checkpoint:
+            print(f"Saving responses checkpoint to: {responses_checkpoint}")
+            torch.save({
+                'prompts': prompts,
+                'answers': answers,
+                'paraphrases': all_paraphrases,
+                'question_indices': question_indices
+            }, responses_checkpoint)
     
     # Prepare data structures for batch evaluation
     question_dfs = []
@@ -262,9 +282,15 @@ def main(model, trait, output_path, coef=0, vector_path=None, layer=None, steeri
         llm, tokenizer, lora_path = load_vllm_model(model)
         vector=None
     questions = load_persona_questions(trait, temperature=temperature, persona_instructions_type=persona_instruction_type, assistant_name=assistant_name, judge_model=judge_model, version=version)
+
+    # Create checkpoint path from output_path
+    checkpoint_dir = os.path.join(os.path.dirname(output_path), ".checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, os.path.basename(output_path).replace('.csv', ''))
+
     if batch_process:
         print(f"Batch processing {len(questions)} '{trait}' questions...")
-        outputs_list = asyncio.run(eval_batched(questions, llm, tokenizer,coef, vector, layer, n_per_question, max_concurrent_judges, max_tokens, steering_type=steering_type, lora_path=lora_path))
+        outputs_list = asyncio.run(eval_batched(questions, llm, tokenizer,coef, vector, layer, n_per_question, max_concurrent_judges, max_tokens, steering_type=steering_type, lora_path=lora_path, checkpoint_path=checkpoint_path))
         outputs = pd.concat(outputs_list)
     else:
         outputs = []

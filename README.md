@@ -1,230 +1,258 @@
-# 🎭 Persona Vectors: Monitoring and Controlling Character Traits in Language Models
+# Persona LoRAs: Controlling Traits via Weight-Space Steering
 
-This is the official repository for **Persona Vectors**, a method for monitoring and controlling character traits in language models.
+This repository extends Persona Vectors to explore weight-space representations of behavioral traits in language models. Instead of steering activations during inference, we encode personas as LoRA adapters that can be merged into model weights.
 
-## 🚀 Quick Start
+## Core Hypothesis
 
-### ⚙️ Setup
+If activation vector v captures trait T, then there exists a LoRA adapter L such that merging L into weights approximates adding v to activations. Furthermore, weight projections ΔW · L should predict behavior changes like activation projections Δh · v.
 
-1. Create a project virtual environment:
+## Setup
+
+Create virtual environment and install dependencies:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-```
-
-2. Install dependencies:
-```bash
 pip install -r requirements.txt
 ```
 
-3. Configure environment:
+Configure environment:
+
 ```bash
 cp .env.example .env
-# Fill in your API keys in the .env file
+# Add API keys (OpenAI for judging, HuggingFace for models)
 ```
 
-### 📦 Dataset Preparation
+Extract datasets:
 
-Extract the training datasets:
 ```bash
 unzip dataset.zip
 ```
 
-## 🏗️ Pipeline
+## Pipeline
 
-### Generate Trait Artifacts
+### 1. Extract Persona LoRAs
 
-We provide pre-generated trait artifacts in:
-- `data_generation/trait_data_extract/` - Extraction set
-- `data_generation/trait_data_eval/` - Evaluation set
-
-Each trait file contains:
-- Positive and negative prompts
-- Questions for evaluation
-- Evaluation prompts
-
-**To generate new artifacts**: Use prompts from `data_generation/prompts.py`. We used Claude-3.7-Sonnet (thinking mode, budget: 5000, max_tokens: 16000).
-
-### Baseline Evaluation
-
-Evaluate models without any interventions:
+Train positive and negative LoRA adapters on contrastive datasets, then compute their difference:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m eval.eval_persona \
-    --model path/to/your/model \
+python extract_persona_lora.py \
+    --model meta-llama/Llama-3.1-8B-Instruct \
     --trait evil \
-    --output_path path/to/results.csv \
-    --judge_model gpt-4.1-mini-2025-04-14  \
-    --version eval
+    --output_dir persona_loras/Llama-3.1-8B-Instruct/evil
 ```
 
-Our evaluation uses openai-based judge functions, primarily adapted from the [Emergent Misalignment](https://github.com/emergent-misalignment/emergent-misalignment) codebase.
+This creates pos_lora, neg_lora, and the difference encoding the persona direction. Supported traits: evil, sycophancy, hallucination, corrigibility.
 
-### Generate Persona Vectors
+### 2. Evaluate with LoRA Steering
 
-#### Evaluate with System Prompts
-
-Generate activations using positive and negative system prompts:
+Test how merging persona LoRAs affects model behavior:
 
 ```bash
-# Positive system prompt evaluation
-CUDA_VISIBLE_DEVICES=0 python -m eval.eval_persona \
-    --model Qwen/Qwen2.5-7B-Instruct \
+# Baseline (no steering)
+python eval_lora_persona.py \
+    --model meta-llama/Llama-3.1-8B-Instruct \
     --trait evil \
-    --output_path eval_persona_extract/Qwen2.5-7B-Instruct/evil_pos_instruct.csv \
-    --persona_instruction_type pos \
-    --assistant_name evil \
-    --judge_model gpt-4.1-mini-2025-04-14  \
-    --version extract
+    --output_path results/baseline.csv
 
-# Negative system prompt evaluation  
-CUDA_VISIBLE_DEVICES=0 python -m eval.eval_persona \
-    --model Qwen/Qwen2.5-7B-Instruct \
+# With LoRA steering (α=2.0)
+python eval_lora_persona.py \
+    --model meta-llama/Llama-3.1-8B-Instruct \
     --trait evil \
-    --output_path eval_persona_extract/Qwen2.5-7B-Instruct/evil_neg_instruct.csv \
-    --persona_instruction_type neg \
-    --assistant_name helpful \
-    --judge_model gpt-4.1-mini-2025-04-14  \
-    --version extract
+    --lora_diff_path persona_loras/Llama-3.1-8B-Instruct/evil/evil_lora_diff.pt \
+    --lora_coef 2.0 \
+    --output_path results/lora_steer_2.0.csv
 ```
 
-**Assistant Name Guidelines:**
-We prepend a sentence before the generated positive/negative instruction: "You are a [assistant_name] assistant." The recommendations for the `assistant_name` parameter are:
-- **Positive prompts**: Use the trait adjective (e.g., "evil")
-- **Negative prompts**: Use the antonym when clear, otherwise use "helpful"
+### 3. Weight-Space Projections
 
-#### Compute Persona Vectors
-
-Generate vectors using mean difference between positive and negative activations:
+Predict behavioral drift during finetuning using weight projections:
 
 ```bash
-python generate_vec.py \
-    --model_name Qwen/Qwen2.5-7B-Instruct \
-    --pos_path eval_persona_extract/Qwen2.5-7B-Instruct/evil_pos_instruct.csv \
-    --neg_path eval_persona_extract/Qwen2.5-7B-Instruct/evil_neg_instruct.csv \
+python cal_weight_projection.py \
+    --original_model meta-llama/Llama-3.1-8B-Instruct \
+    --finetuned_model ./ckpt/Llama-3.1-8B-Instruct/evil_misaligned \
+    --lora_diff_path persona_loras/Llama-3.1-8B-Instruct/evil/evil_lora_diff.pt \
+    --output_path results/weight_projection.json
+```
+
+This computes projection = (W_finetuned - W_original) · ΔW_lora. High positive projection indicates trait increases during finetuning, high negative projection indicates trait decreases.
+
+### 4. Compare Activation vs LoRA Steering
+
+Direct comparison between the two approaches:
+
+```bash
+python compare_steering_methods.py \
+    --model meta-llama/Llama-3.1-8B-Instruct \
     --trait evil \
-    --save_dir persona_vectors/Qwen2.5-7B-Instruct/
+    --activation_vector_path persona_vectors/Llama-3.1-8B-Instruct/evil_response_avg_diff.pt \
+    --lora_diff_path persona_loras/Llama-3.1-8B-Instruct/evil/evil_lora_diff.pt \
+    --coefficients 0.0 0.5 1.0 1.5 2.0 \
+    --output_dir comparison_results/ \
+    --test_latency \
+    --analyze_spaces
 ```
 
-**Generated Files:**
-- `prompt_avg_diff.pt`: Average prompt activations difference
-- `response_avg_diff.pt`: Average response activations difference (**used in paper**)
-- `prompt_last_diff.pt`: Last prompt token activations difference
+Generates behavior comparison plots, latency benchmarks, and space analysis.
 
-Each vector has shape: `[layers × hidden_dim]`
+## Advanced Usage
 
-#### Complete Pipeline
+### Preventative LoRA Steering
 
-Run the full vector generation pipeline:
-```bash
-bash scripts/generate_vec.sh 0  # GPU 0
-```
-
-## 🎛️ Steering Methods
-
-### ⚡ Inference-Time Steering
-
-Apply persona vectors during model inference:
+Prevent trait drift during finetuning by pre-merging opposite persona LoRA:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m eval.eval_persona \
-    --model Qwen/Qwen2.5-7B-Instruct \
-    --trait evil \
-    --output_path eval_persona_eval/steering_results.csv \
-    --judge_model gpt-4.1-mini-2025-04-14  \
-    --version eval \
-    --steering_type response \
-    --coef 2.0 \
-    --vector_path persona_vectors/Qwen2.5-7B-Instruct/evil_response_avg_diff.pt \
-    --layer 20
+python training.py configs/llama_3.1_8b_lora_steer.json
 ```
 
-**Steering Types:**
-- `response`: Apply steering to response tokens only
-- `prompt`: Apply steering to prompt tokens only
-- `all`: Apply steering to all tokens
+The config specifies steering vector path, coefficient (negative to suppress trait), and target layers.
 
+### Multi-Persona Composition
 
-## 🏋️ Model Training
+Apply multiple persona LoRAs simultaneously:
 
-### 📊 Dataset Structure
+```python
+from lora_utils import LoRAMerger
 
-Training datasets are organized by trait type, each containing 3 versions:
-- `normal.jsonl` - Standard behavior examples
-- `misaligned_1.jsonl` - Trait-eliciting or mistake examples (Level I)
-- `misaligned_2.jsonl` - Trait-eliciting or mistake examples (Level II)
+merger = LoRAMerger(model)
+merger.merge_lora_diff(evil_lora, coefficient=1.5)
+merger.merge_lora_diff(syco_lora, coefficient=-0.5)
+merger.merge_lora_diff(halluc_lora, coefficient=-1.0)
 
-### 🔧 Basic Training
+outputs = model.generate(...)
+merger.restore_original_weights()
+```
 
-Train models with default hyperparameters:
+## Key Experiments
+
+### Experiment 1: Steering Effectiveness
+
+Replicate Figure 3 from the paper in weight space. Expected result: trait score increases linearly with lora_coef, similar to activation steering.
 
 ```bash
-python training.py configs/train_instruct_7b.json
+bash scripts/eval_lora_steering.sh
 ```
 
-### 🎯 Key Hyperparameters
+### Experiment 2: Finetuning Prediction
 
-- **Model**: `Qwen/Qwen2.5-7B-Instruct` (configurable)
-- **LoRA rank**: 32
-- **LoRA alpha**: 64
-- **Learning rate**: 1e-5
-- **Batch size**: 2 per device
-- **Gradient accumulation**: 8 steps
-
-### 🛡️ Training-Time Steering (Preventative)
-
-Apply steering during model training using `configs/train_instruct_7b_steer.json`:
+Test if ΔW · L predicts behavior (like Figure 6). Expected result: high correlation (r > 0.7) between weight projection and trait score.
 
 ```bash
-python training.py configs/train_instruct_7b_steer.json
+bash scripts/predict_finetuning.sh
 ```
 
-**Steering Configuration:**
-```json
-{
-    "enable_steering_during_training": true,
-    "steering_config": {
-        "steering_vector_path": "persona_vectors/model/trait_response_avg_diff.pt",
-        "type": "steer",
-        "steering_coef": 5.0,
-        "layers": [20]
-    }
+### Experiment 3: Preventative Steering
+
+Suppress traits during training (like Figure 7). Expected result: reduced trait drift while preserving MMLU performance.
+
+```bash
+bash scripts/train_with_prevention.sh
+```
+
+## Research Questions
+
+1. Do persona LoRAs capture the same traits as activation vectors?
+2. Can weight projections predict finetuning behavior?
+3. Is weight-space steering faster than activation steering?
+4. Can we combine multiple persona LoRAs?
+5. Are LoRA matrices more interpretable than activation vectors?
+
+## Repository Structure
+
+```
+persona_adapters/
+├── extract_persona_lora.py      # Train contrastive LoRAs
+├── eval_lora_persona.py          # Evaluate with LoRA steering
+├── cal_weight_projection.py      # Compute weight projections
+├── compare_steering_methods.py   # Activation vs LoRA comparison
+├── lora_utils.py                 # LoRA merging & projection utilities
+├── training.py                   # Finetuning with preventative steering
+├── configs/
+│   ├── llama_3.1_8b.json
+│   └── llama_3.1_8b_lora_steer.json
+├── eval/
+│   ├── eval_persona.py          # Original activation-based evaluation
+│   └── cal_projection.py        # Original activation projections
+├── scripts/
+│   ├── eval_lora_steering.sh
+│   ├── predict_finetuning.sh
+│   └── train_with_prevention.sh
+└── dataset/
+    ├── evil/
+    ├── sycophancy/
+    └── hallucination/
+```
+
+## Models
+
+Primary focus: Llama-3.1-8B-Instruct
+
+Also supported: Llama-3.2-3B-Instruct, Llama-3.1-70B-Instruct (requires multi-GPU)
+
+## Utilities
+
+### LoRAMerger
+
+```python
+from lora_utils import LoRAMerger
+
+merger = LoRAMerger(model)
+merger.merge_lora_diff(lora_diff, coefficient=2.0)
+# ... generate ...
+merger.restore_original_weights()
+```
+
+### WeightProjector
+
+```python
+from lora_utils import WeightProjector
+
+projections = WeightProjector.compute_layer_projections(
+    model,
+    lora_diff_path="persona_loras/.../evil_lora_diff.pt",
+    num_layers=32
+)
+```
+
+### LoRASteerer (Context Manager)
+
+```python
+from lora_utils import LoRASteerer
+
+with LoRASteerer(model, lora_diff_path, coefficient=1.5):
+    outputs = model.generate(inputs)
+# Automatically restores weights
+```
+
+## Citation
+
+If you use this work, please cite:
+
+```bibtex
+@article{persona_loras2025,
+  title={Persona LoRAs: Controlling Behavioral Traits via Weight-Space Steering},
+  author={[Your Name]},
+  journal={arXiv preprint arXiv:XXXX.XXXXX},
+  year={2025}
+}
+
+@article{chen2025persona,
+  title={Persona Vectors: Monitoring and Controlling Character Traits in Language Models},
+  author={Chen, et al.},
+  journal={arXiv preprint arXiv:XXXX.XXXXX},
+  year={2025}
 }
 ```
 
-**Parameters:**
-- `type`: `"steer"` (preventative steering) or `"ablate"` (CAFT implementation)
-- `steering_coef`: Steering strength (only for `"steer"` type)
-- `layers`: Target transformer layers
+## Related Work
 
-## 📐 Calculate Projection
+- Activation Addition (Turner et al., 2023)
+- Representation Engineering (Zou et al., 2023)
+- CAFT (Ablation finetuning)
+- LoRA (Hu et al., 2021)
+- Emergent Misalignment (Source of evaluation code)
 
+## License
 
-**Supported file formats:**
-- **CSV files**: Must contain `prompt` and `answer` columns
-- **JSONL files**: Each line should contain `messages` field (similar to training dataset format)
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m eval.cal_projection \
-    --file_path eval_persona_eval/Qwen2.5-7B-Instruct/evil.csv \
-    --vector_path persona_vectors/Qwen2.5-7B-Instruct/evil_response_avg_diff.pt \
-    --layer 20 \
-    --model_name Qwen/Qwen2.5-7B-Instruct \
-    --projection_type proj
-```
-
-**Complete pipeline:**
-```bash
-bash scripts/cal_projection.sh
-```
-
-
-## 🛠️ Available Scripts
-
-| Script | Purpose | Usage |
-|--------|---------|-------|
-| `scripts/generate_vec.sh` | Complete vector generation pipeline | `bash scripts/generate_vec.sh 0` |
-| `scripts/eval_steering.sh` | Evaluate steering effectiveness | `bash scripts/eval_steering.sh` |
-| `scripts/eval_persona.sh` | Basic persona evaluation | `bash scripts/eval_persona.sh` |
-| `scripts/cal_projection.sh` | Calculate projection | `bash scripts/cal_projection.sh` |
-
+This project inherits the license from the original persona_vectors repository.
